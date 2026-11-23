@@ -26,36 +26,68 @@ def _record(msg='{"logtype": 4002, "logdata": {"PASSWORD": "Hunter2!"}}'):
     return logging.LogRecord("t", logging.WARNING, __file__, 1, msg, None, None)
 
 
-def _handlers():
-    return (
-        WebhookHandler("http://127.0.0.1:9/hook"),
-        SlackHandler("http://127.0.0.1:9/slack"),
-        TeamsHandler("http://127.0.0.1:9/teams"),
-    )
+class Resp:
+    def __init__(self, status):
+        self.status_code = status
+        self.text = ""
 
 
-def _wait(handler):
-    deadline = time.time() + 5
+def _fast(handler):
+    handler.RETRY_SECONDS = 0.5
+    handler.BACKOFF_START = 0.02
+    handler.BACKOFF_MAX = 0.05
+    return handler
+
+
+def _settle(handler, timeout=3):
+    deadline = time.time() + timeout
     while handler._queue.unfinished_tasks and time.time() < deadline:
         time.sleep(0.01)
 
 
-def test_http_handlers_fail_quietly_with_a_timeout(monkeypatch, capsys):
-    seen = []
+def test_retries_until_the_hub_recovers(monkeypatch):
+    outcomes = iter([requests.ConnectionError("down"), Resp(503), Resp(204)])
+    calls = []
 
-    def refuse(*args, **kwargs):
-        seen.append(kwargs.get("timeout"))
-        raise requests.ConnectionError("refused")
+    def fake(*args, **kwargs):
+        calls.append(kwargs.get("timeout"))
+        result = next(outcomes)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
-    monkeypatch.setattr(requests, "request", refuse)
-    monkeypatch.setattr(requests, "post", refuse)
-    for handler in _handlers():
-        handler.emit(_record())
-    time.sleep(0.5)
-    assert seen and all(seen)  # every delivery attempt set a timeout
+    monkeypatch.setattr(requests, "request", fake)
+    handler = _fast(WebhookHandler("http://hub/v1/opencanary", status_code=204))
+    handler.emit(_record())
+    _settle(handler)
+    assert handler.delivered == 1 and handler.exhausted == 0
+    assert len(calls) == 3 and all(calls)  # every attempt has a timeout
+
+
+def test_gives_up_quietly_and_counts(monkeypatch, capsys):
+    monkeypatch.setattr(requests, "request", lambda *a, **k: Resp(503))
+    monkeypatch.setattr(requests, "post", lambda *a, **k: Resp(503))
+    for handler in (
+        WebhookHandler("http://hub/hook", status_code=204),
+        SlackHandler("http://s"),
+        TeamsHandler("http://t"),
+    ):
+        _fast(handler).emit(_record())
+        _settle(handler)
+        assert handler.exhausted == 1 and handler.delivered == 0
     err = capsys.readouterr().err
-    assert "delivery failed: ConnectionError" in err
-    assert "Hunter2!" not in err  # the record body is never echoed
+    assert "gave up after retries (HTTP 503)" in err and "Hunter2!" not in err
+
+
+def test_permanent_errors_are_not_retried(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        requests, "request", lambda *a, **k: calls.append(1) or Resp(401)
+    )
+    handler = _fast(WebhookHandler("http://hub/hook", status_code=204))
+    handler.emit(_record())
+    _settle(handler)
+    assert len(calls) == 1
 
 
 def test_slow_endpoint_does_not_block_the_caller(monkeypatch):

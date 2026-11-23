@@ -10,6 +10,7 @@ from logging.handlers import SocketHandler
 from twisted.internet import reactor
 import queue
 import threading
+import time
 
 import requests
 
@@ -18,34 +19,98 @@ from opencanary.iphelper import check_ip
 HTTP_TIMEOUT = 10
 
 
+class RetryableDelivery(Exception):
+    """The endpoint is temporarily unable to accept the event (connection error, 429, 5xx)."""
+
+
+RETRY_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+
+
 class AsyncDeliveryMixin:
     """Deliver on a background thread so a slow or dead endpoint never blocks the
-    reactor (protocol handling and heartbeats). The queue is bounded; overflow is
-    counted, not buffered forever."""
+    reactor (protocol handling and heartbeats).
+
+    Temporary failures (connection errors, 429, 5xx) are retried with exponential
+    backoff for about RETRY_SECONDS before the event is given up. The queue is
+    bounded; overflow and exhausted retries are counted and reported on stderr,
+    never with the event body, which can carry credentials."""
 
     QUEUE_SIZE = 1000
+    RETRY_SECONDS = 300
+    BACKOFF_START = 1.0
+    BACKOFF_MAX = 60.0
 
     def _start_worker(self):
         self._queue = queue.Queue(maxsize=self.QUEUE_SIZE)
-        self.dropped = 0
+        self.dropped = 0  # queue overflow
+        self.exhausted = 0  # gave up after retrying
+        self.delivered = 0
         threading.Thread(target=self._run, daemon=True).start()
+
+    def _report(self, what, count):
+        if count == 1 or count % 100 == 0:
+            sys.stderr.write(
+                "%s: %s (%d so far)\n" % (type(self).__name__, what, count)
+            )
 
     def emit(self, record):
         try:
             self._queue.put_nowait(record)
         except queue.Full:
             self.dropped += 1
+            self._report("queue full, event dropped", self.dropped)
+
+    def _attempt(self, record):
+        try:
+            self.deliver(record)
+        except requests.RequestException as e:
+            raise RetryableDelivery(type(e).__name__)
 
     def _run(self):
         while True:
             record = self._queue.get()
             try:
-                self.deliver(record)
+                self._deliver_with_retry(record)
+            finally:
+                self._queue.task_done()
+
+    def _deliver_with_retry(self, record):
+        deadline = time.monotonic() + self.RETRY_SECONDS
+        delay = self.BACKOFF_START
+        while True:
+            try:
+                self._attempt(record)
+                self.delivered += 1
+                return
+            except RetryableDelivery as e:
+                if time.monotonic() + delay > deadline:
+                    self.exhausted += 1
+                    self._report(
+                        "gave up after retries (%s), event dropped" % e, self.exhausted
+                    )
+                    return
+                time.sleep(delay)
+                delay = min(delay * 2, self.BACKOFF_MAX)
             except Exception as e:
-                # Never echo the record: it can carry the credentials an attacker tried.
-                sys.stderr.write(
-                    "%s delivery failed: %s\n" % (type(self).__name__, type(e).__name__)
+                self.exhausted += 1
+                self._report(
+                    "delivery failed: %s, event dropped" % type(e).__name__,
+                    self.exhausted,
                 )
+                return
+
+
+def _check_status(handler, response, expected):
+    if response.status_code == expected or (
+        expected == 200 and 200 <= response.status_code < 300
+    ):
+        return
+    if response.status_code in RETRY_STATUSES:
+        raise RetryableDelivery("HTTP %d" % response.status_code)
+    sys.stderr.write(
+        "%s: endpoint returned HTTP %d, event dropped\n"
+        % (type(handler).__name__, response.status_code)
+    )
 
 
 class Singleton(type):
@@ -305,11 +370,7 @@ class SlackHandler(AsyncDeliveryMixin, logging.Handler):
     def deliver(self, record):
         data = self.generate_msg(record)
         response = requests.post(self.webhook_url, json=data, timeout=HTTP_TIMEOUT)
-        if response.status_code != 200:
-            print(
-                "Error %s sending Slack message, the response was:\n%s"
-                % (response.status_code, response.text)
-            )
+        _check_status(self, response, 200)
 
 
 class TeamsHandler(AsyncDeliveryMixin, logging.Handler):
@@ -386,11 +447,7 @@ class TeamsHandler(AsyncDeliveryMixin, logging.Handler):
         response = requests.post(
             self.webhook_url, headers=headers, json=payload, timeout=HTTP_TIMEOUT
         )
-        if response.status_code != 202:
-            print(
-                "Error %s sending Teams message, the response was:\n%s"
-                % (response.status_code, response.text)
-            )
+        _check_status(self, response, 202)
 
 
 def map_string(data, mapping):
@@ -452,8 +509,4 @@ class WebhookHandler(AsyncDeliveryMixin, logging.Handler):
         )
         response = requests.request(method=self.method, url=self.url, **body, **kwargs)
 
-        if response.status_code != self.status_code:
-            print(
-                "Error %s sending Requests payload, the response was:\n%s"
-                % (response.status_code, response.text)
-            )
+        _check_status(self, response, self.status_code)
