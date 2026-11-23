@@ -179,10 +179,11 @@ class MSSQLProtocol(Protocol, TimeoutMixin):
         except Exception:
             return None
 
-        def decodePassChar(c):
+        def decodePassword(raw):
             # https://msdn.microsoft.com/en-us/library/dd304019.aspx
-            c = ord(c) ^ 0xA5
-            return chr(((c & 0x0F) << 4) | (c >> 4))
+            # Each byte was nibble-swapped then XORed with 0xA5. Iterating bytes yields
+            # ints in Python 3, so decode as bytes (ord() here dropped every password).
+            return bytes((((b ^ 0xA5) & 0x0F) << 4) | ((b ^ 0xA5) >> 4) for b in raw)
 
         fields = {}
         for i, fieldname in enumerate(MSSQLProtocol.LOGIN7_FIELDS):
@@ -199,7 +200,7 @@ class MSSQLProtocol(Protocol, TimeoutMixin):
                 )  # this is character count, not count of bytes
                 _fdata = data[findex : findex + flen]
                 if field == "Password":
-                    _fdata = "".join(map(decodePassChar, _fdata))
+                    _fdata = decodePassword(_fdata)
                 loginData[field] = _fdata.decode("utf-16")
             except Exception:
                 pass

@@ -8,12 +8,44 @@ import sys
 from datetime import datetime
 from logging.handlers import SocketHandler
 from twisted.internet import reactor
+import queue
+import threading
+
 import requests
 
 from opencanary.iphelper import check_ip
 
-# Alert handlers run on the reactor thread; never let a slow endpoint block it.
 HTTP_TIMEOUT = 10
+
+
+class AsyncDeliveryMixin:
+    """Deliver on a background thread so a slow or dead endpoint never blocks the
+    reactor (protocol handling and heartbeats). The queue is bounded; overflow is
+    counted, not buffered forever."""
+
+    QUEUE_SIZE = 1000
+
+    def _start_worker(self):
+        self._queue = queue.Queue(maxsize=self.QUEUE_SIZE)
+        self.dropped = 0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def emit(self, record):
+        try:
+            self._queue.put_nowait(record)
+        except queue.Full:
+            self.dropped += 1
+
+    def _run(self):
+        while True:
+            record = self._queue.get()
+            try:
+                self.deliver(record)
+            except Exception as e:
+                # Never echo the record: it can carry the credentials an attacker tried.
+                sys.stderr.write(
+                    "%s delivery failed: %s\n" % (type(self).__name__, type(e).__name__)
+                )
 
 
 class Singleton(type):
@@ -253,10 +285,11 @@ class HpfeedsHandler(logging.Handler):
             print("Error on publishing to server")
 
 
-class SlackHandler(logging.Handler):
+class SlackHandler(AsyncDeliveryMixin, logging.Handler):
     def __init__(self, webhook_url):
         logging.Handler.__init__(self)
         self.webhook_url = webhook_url
+        self._start_worker()
 
     def generate_msg(self, alert):
         msg = {}
@@ -269,13 +302,9 @@ class SlackHandler(logging.Handler):
             )
         return {"attachments": [msg]}
 
-    def emit(self, record):
+    def deliver(self, record):
         data = self.generate_msg(record)
-        try:
-            response = requests.post(self.webhook_url, json=data, timeout=HTTP_TIMEOUT)
-        except requests.RequestException:
-            self.handleError(record)
-            return
+        response = requests.post(self.webhook_url, json=data, timeout=HTTP_TIMEOUT)
         if response.status_code != 200:
             print(
                 "Error %s sending Slack message, the response was:\n%s"
@@ -283,10 +312,11 @@ class SlackHandler(logging.Handler):
             )
 
 
-class TeamsHandler(logging.Handler):
+class TeamsHandler(AsyncDeliveryMixin, logging.Handler):
     def __init__(self, webhook_url):
         logging.Handler.__init__(self)
         self.webhook_url = webhook_url
+        self._start_worker()
 
     def message(self, data):
         return {
@@ -349,17 +379,13 @@ class TeamsHandler(logging.Handler):
                 facts.extend(nested)
         return facts
 
-    def emit(self, record):
+    def deliver(self, record):
         data = json.loads(record.msg)
         payload = self.message(data)
         headers = {"Content-Type": "application/json"}
-        try:
-            response = requests.post(
-                self.webhook_url, headers=headers, json=payload, timeout=HTTP_TIMEOUT
-            )
-        except requests.RequestException:
-            self.handleError(record)
-            return
+        response = requests.post(
+            self.webhook_url, headers=headers, json=payload, timeout=HTTP_TIMEOUT
+        )
         if response.status_code != 202:
             print(
                 "Error %s sending Teams message, the response was:\n%s"
@@ -388,7 +414,7 @@ def map_string(data, mapping):
     return data
 
 
-class WebhookHandler(logging.Handler):
+class WebhookHandler(AsyncDeliveryMixin, logging.Handler):
     def __init__(
         self, url, method="POST", data=None, status_code=200, ignore=None, **kwargs
     ):
@@ -399,8 +425,9 @@ class WebhookHandler(logging.Handler):
         self.status_code = status_code
         self.ignore = ignore
         self.kwargs = kwargs
+        self._start_worker()
 
-    def emit(self, record):
+    def deliver(self, record):
         message = self.format(record)
         if self.ignore is not None:
             if any(e in message for e in self.ignore):
@@ -423,13 +450,7 @@ class WebhookHandler(logging.Handler):
             if "application/json" in kwargs.get("headers", {}).values()
             else {"data": data}
         )
-        try:
-            response = requests.request(
-                method=self.method, url=self.url, **body, **kwargs
-            )
-        except requests.RequestException:
-            self.handleError(record)
-            return
+        response = requests.request(method=self.method, url=self.url, **body, **kwargs)
 
         if response.status_code != self.status_code:
             print(
