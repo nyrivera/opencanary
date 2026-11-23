@@ -430,8 +430,8 @@ class CanarySSH(CanaryService):
         )
 
         # need to ensure there's a trailing CRLF
-        if self.preauth_banner and not self.preauth_banner.endswith("\r\n"):
-            self.preauth_banner += "\r\n"
+        if self.preauth_banner and not self.preauth_banner.endswith(b"\r\n"):
+            self.preauth_banner += b"\r\n"
 
         self.ssh_keys_path = config.getVal("ssh.key_path", default=SSH_PATH)
         self.listen_addr = config.getVal("device.listen_addr", default="")

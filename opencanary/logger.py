@@ -12,6 +12,9 @@ import requests
 
 from opencanary.iphelper import check_ip
 
+# Alert handlers run on the reactor thread; never let a slow endpoint block it.
+HTTP_TIMEOUT = 10
+
 
 class Singleton(type):
     _instances = {}
@@ -268,7 +271,11 @@ class SlackHandler(logging.Handler):
 
     def emit(self, record):
         data = self.generate_msg(record)
-        response = requests.post(self.webhook_url, json=data)
+        try:
+            response = requests.post(self.webhook_url, json=data, timeout=HTTP_TIMEOUT)
+        except requests.RequestException:
+            self.handleError(record)
+            return
         if response.status_code != 200:
             print(
                 "Error %s sending Slack message, the response was:\n%s"
@@ -346,7 +353,13 @@ class TeamsHandler(logging.Handler):
         data = json.loads(record.msg)
         payload = self.message(data)
         headers = {"Content-Type": "application/json"}
-        response = requests.post(self.webhook_url, headers=headers, json=payload)
+        try:
+            response = requests.post(
+                self.webhook_url, headers=headers, json=payload, timeout=HTTP_TIMEOUT
+            )
+        except requests.RequestException:
+            self.handleError(record)
+            return
         if response.status_code != 202:
             print(
                 "Error %s sending Teams message, the response was:\n%s"
@@ -404,14 +417,19 @@ class WebhookHandler(logging.Handler):
                 data = self.data
             data = map_string(deepcopy(data), mapping)
 
-        if "application/json" in self.kwargs.get("headers", {}).values():
+        kwargs = {"timeout": HTTP_TIMEOUT, **self.kwargs}
+        body = (
+            {"json": data}
+            if "application/json" in kwargs.get("headers", {}).values()
+            else {"data": data}
+        )
+        try:
             response = requests.request(
-                method=self.method, url=self.url, json=data, **self.kwargs
+                method=self.method, url=self.url, **body, **kwargs
             )
-        else:
-            response = requests.request(
-                method=self.method, url=self.url, data=data, **self.kwargs
-            )
+        except requests.RequestException:
+            self.handleError(record)
+            return
 
         if response.status_code != self.status_code:
             print(
