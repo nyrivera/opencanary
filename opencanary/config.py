@@ -39,6 +39,7 @@ SERVICE_REGEXES = {
 }
 
 INTEGER_RANGES = {
+    "device.heartbeat_interval": (0, None),
     "redis.max_arg_length": (0, None),
     "redis.max_bulk_string_length": (1, None),
     "redis.max_connections": (0, None),

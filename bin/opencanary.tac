@@ -189,3 +189,15 @@ for klass in start_modules:
 
 msg = "Canary running!!!"
 logMsg({"logdata": msg})
+
+# Optional liveness signal so a collector can tell a quiet sensor from a dead one.
+heartbeat_interval = config.getVal("device.heartbeat_interval", default=0)
+if heartbeat_interval:
+    from twisted.application.internet import TimerService
+
+    TimerService(
+        heartbeat_interval,
+        logger.log,
+        {"logtype": logger.LOG_BASE_PING, "logdata": {"msg": "heartbeat"}},
+        retry=False,
+    ).setServiceParent(application)
